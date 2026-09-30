@@ -52,6 +52,7 @@ typedef enum pyrowave_result
 	PYROWAVE_ERROR_UNSUPPORTED_DEVICE = -5,
 	PYROWAVE_ERROR_SHADER_COMPILATION = -6,
 	PYROWAVE_ERROR_CORRUPT_BITSTREAM = -7,
+	PYROWAVE_ERROR_BUSY = -8, // Bounded upload slots are still consumed by the GPU.
 	PYROWAVE_ERROR_INT_MAX = 0x7fffffff
 } pyrowave_result;
 
@@ -296,6 +297,10 @@ typedef struct pyrowave_gpu_buffers
 	pyrowave_mtl_texture planes[3];
 } pyrowave_gpu_buffers;
 
+// At most four uploads may remain in flight. If all are occupied, returns
+// PYROWAVE_ERROR_BUSY without waiting or consuming the parsed frame. Submit the
+// queued command buffers, wait for capacity on a control worker, then retry.
+//
 // Encodes the decode work into the supplied id<MTLCommandBuffer>. Nothing is
 // committed; the caller owns submission, and may encode MTLSharedEvent waits or
 // signals on the same command buffer to synchronize with other work.

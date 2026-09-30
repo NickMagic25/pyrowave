@@ -47,13 +47,15 @@ struct UploadSlot
 	id<MTLBuffer> payload;
 	id<MTLCommandBuffer> consumer;
 
-	void reclaim()
+	bool reclaim()
 	{
 		if (!consumer)
-			return;
+			return true;
 		// Returns immediately unless the caller really is UploadSlotCount ahead.
-		[consumer waitUntilCompleted];
+		if (consumer.status != MTLCommandBufferStatusCompleted && consumer.status != MTLCommandBufferStatusError)
+			return false;
 		consumer = nil;
+		return true;
 	}
 
 	// No destructor: ARC releases both buffers, and Metal keeps anything a command
@@ -97,17 +99,27 @@ bool ensure_buffer(pyrowave_device device, __strong id<MTLBuffer> *buffer, size_
 	return true;
 }
 
-UploadSlot *acquire_upload_slot(pyrowave_decoder decoder, size_t offsets_size, size_t payload_size)
+UploadSlot *acquire_upload_slot(pyrowave_decoder decoder, size_t offsets_size, size_t payload_size,
+                                pyrowave_result &result)
 {
 	UploadSlot *slot = &decoder->upload_slots[decoder->next_upload_slot];
-	decoder->next_upload_slot = (decoder->next_upload_slot + 1) % UploadSlotCount;
 
 	// Applies back pressure rather than allocating another slot.
-	slot->reclaim();
+	if (!slot->reclaim())
+	{
+		result = PYROWAVE_ERROR_BUSY;
+		return nullptr;
+	}
 
 	if (!ensure_buffer(decoder->device, &slot->offsets, offsets_size) ||
 	    !ensure_buffer(decoder->device, &slot->payload, payload_size))
+	{
+		result = PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
 		return nullptr;
+	}
+
+	decoder->next_upload_slot = (decoder->next_upload_slot + 1) % UploadSlotCount;
+	result = PYROWAVE_SUCCESS;
 
 	return slot;
 }
@@ -221,6 +233,10 @@ bool validate_plane(pyrowave_device device, id<MTLTexture> texture, int index, i
 		return false;
 	}
 
+	if (texture.device != device->mtl ||
+	    (texture.pixelFormat != MTLPixelFormatR8Unorm && texture.pixelFormat != MTLPixelFormatR16Unorm && texture.pixelFormat != MTLPixelFormatR32Float))
+		return false;
+
 	if (texture.textureType != MTLTextureType2D)
 	{
 		device->log("Output plane %d must be MTLTextureType2D.", index);
@@ -317,7 +333,8 @@ bool pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bo
 	// num_pristine_bands is range checked only by an assert in has_pristine_bands(),
 	// matching the Vulkan C API. It indexes block_meta[..][DecompositionLevels - band][..],
 	// so a large enough value walks off the front of the array with NDEBUG.
-	if (!decoder)
+	if (!decoder || num_pristine_bands < 0 || num_pristine_bands >= DecompositionLevels ||
+	    !(minimum_packet_ratio >= 0.0f && minimum_packet_ratio <= 1.0f) || (!active_block_mask && word_count))
 		return false;
 
 	return decoder->parser.decode_is_ready(allow_partial_frame, num_pristine_bands, minimum_packet_ratio,
@@ -356,14 +373,17 @@ pyrowave_result pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 	// The dequant shader can read slightly past the end of the payload, so pad.
 	const size_t payload_size = payload.size() * sizeof(uint32_t) + 16;
 
-	auto *slot = acquire_upload_slot(decoder, offsets_size, payload_size);
+	pyrowave_result upload_result;
+	auto *slot = acquire_upload_slot(decoder, offsets_size, payload_size, upload_result);
 	if (!slot)
-		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
+		return upload_result;
 
 	if (offsets_size)
 		memcpy(slot->offsets.contents, offsets.data(), offsets_size);
 	if (!payload.empty())
 		memcpy(slot->payload.contents, payload.data(), payload.size() * sizeof(uint32_t));
+
+	memset(static_cast<uint8_t *>(slot->payload.contents) + payload.size() * sizeof(uint32_t), 0, 16);
 
 	auto *cmd = (__bridge id<MTLCommandBuffer>)(command_buffer);
 

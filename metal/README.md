@@ -13,3 +13,21 @@ Port notes:
 * You can set the environment variable PYROWAVE_PRECISION to 0, 1, or 2, to make the same precision/speed tradeoffs as the main library.
 * Using FP32 math and FP16 storage in the shaders ended up being the fastest and most accurate combination on Apple hardware.
 * This implementation is roughly twice as fast as the Vulkan implementation running on KosmicKrisp on macOS
+
+Decoder upload admission is bounded to four outstanding command buffers. When
+all upload slots are occupied, decoding returns `PYROWAVE_ERROR_BUSY` without
+waiting for GPU completion or consuming the parsed frame. Commit pending work
+and retry after it completes. A caller can keep the wait on a control worker,
+away from packet receive and display callbacks.
+
+To run the Metal admission regression on supported Apple hardware:
+
+```sh
+cmake -S metal -B build-metal -DPYROWAVE_METAL_BUILD_TESTS=ON
+cmake --build build-metal
+ctest --test-dir build-metal --output-on-failure
+```
+
+The test deliberately leaves four decode commands uncommitted, checks that the
+fifth returns busy with its frame intact, then commits and verifies successful
+retry and GPU output. It also checks invalid partial-frame sideband values.

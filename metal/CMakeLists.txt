@@ -32,6 +32,18 @@ find_library(IOSURFACE_LIBRARY NAMES IOSurface REQUIRED)
 find_library(METAL_LIBRARY NAMES Metal REQUIRED)
 target_link_libraries(pyrowave-metal PRIVATE ${IOSURFACE_LIBRARY} ${METAL_LIBRARY})
 
+option(PYROWAVE_METAL_BUILD_TESTS "Build native Metal decoder regression tests" OFF)
+if(PYROWAVE_METAL_BUILD_TESTS)
+    enable_testing()
+    add_executable(pyrowave-metal-admission tests/decoder_admission.mm)
+    target_include_directories(pyrowave-metal-admission PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(pyrowave-metal-admission PRIVATE -fobjc-arc -UNDEBUG)
+    target_link_libraries(pyrowave-metal-admission PRIVATE pyrowave-metal ${METAL_LIBRARY} "-framework Foundation")
+    target_link_options(pyrowave-metal-admission PRIVATE "-fobjc-link-runtime")
+    add_test(NAME metal-decoder-admission COMMAND pyrowave-metal-admission)
+    set_tests_properties(metal-decoder-admission PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+endif()
+
 set_target_properties(pyrowave-metal
 		PROPERTIES VERSION ${PYROWAVE_METAL_API_VERSION}
 		SOVERSION ${PYROWAVE_METAL_API_VERSION_MAJOR}
