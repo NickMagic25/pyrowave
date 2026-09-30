@@ -41,6 +41,7 @@ const char *result_string(pyrowave_result result)
 	case PYROWAVE_ERROR_UNSUPPORTED_DEVICE: return "unsupported device";
 	case PYROWAVE_ERROR_SHADER_COMPILATION: return "shader compilation failed";
 	case PYROWAVE_ERROR_CORRUPT_BITSTREAM: return "corrupt bitstream";
+	case PYROWAVE_ERROR_BUSY: return "upload slots busy";
 	default: return "unknown error";
 	}
 }
