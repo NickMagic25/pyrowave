@@ -73,6 +73,12 @@ id<MTLComputePipelineState> create_pipeline_bool_constant(pyrowave_device device
                                                           uint32_t required_threads,
                                                           uint32_t index, bool value);
 
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+// Lazily compiled only when the private benchmark explicitly opts into batching.
+pyrowave_result ensure_batched_dequant_pipeline(pyrowave_device device);
+pyrowave_result ensure_reduced_barrier_idwt_pipelines(pyrowave_device device);
+#endif
+
 // The wavelet coefficient pyramid. The decoder fills it from the bitstream and
 // runs the iDWT out of it; the encoder runs the DWT into it and quantizes out of
 // it. Both want exactly the same texture and the same set of views, so this is
@@ -103,6 +109,13 @@ struct pyrowave_device_opaque
 	id<MTLComputePipelineState> dequant_pipeline;
 	// Indexed by the DCShift function constant.
 	id<MTLComputePipelineState> idwt_pipeline[2];
+
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+	id<MTLComputePipelineState> bench_batched_dequant_pipeline;
+	std::mutex bench_batched_dequant_lock;
+	id<MTLComputePipelineState> bench_reduced_barrier_idwt_pipeline[2];
+	std::mutex bench_reduced_barrier_idwt_lock;
+#endif
 
 	// Encode. Compiled on demand by the first pyrowave_encoder_create(), so that
 	// decode-only users do not pay for six extra shader compiles.

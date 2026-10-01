@@ -8,6 +8,11 @@
 
 #include "shaders/pyrowave_msl.h"
 
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+#include "experimental_dequant.msl.h"
+#include "experimental_idwt.msl.h"
+#endif
+
 #include <memory>
 #include <stdarg.h>
 #include <stdio.h>
@@ -112,6 +117,75 @@ id<MTLComputePipelineState> create_pipeline_bool_constant(pyrowave_device device
 	[constants setConstantValue:&value type:MTLDataTypeBool atIndex:index];
 	return create_pipeline(device, library, entry_point, required_threads, constants);
 }
+
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+pyrowave_result ensure_batched_dequant_pipeline(pyrowave_device device)
+{
+	std::lock_guard<std::mutex> holder{device->bench_batched_dequant_lock};
+	if (device->bench_batched_dequant_pipeline)
+		return PYROWAVE_SUCCESS;
+
+	std::string source;
+	try
+	{
+		if (!build_batched_dequant_msl(wavelet_dequant_msl_source, source))
+		{
+			device->log("Canonical dequant shader changed; refusing to build the benchmark variant.");
+			return PYROWAVE_ERROR_SHADER_COMPILATION;
+		}
+	}
+	catch (const std::bad_alloc &)
+	{
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	}
+
+	auto *library = compile_library(device, source.c_str(), "experimental batched wavelet_dequant");
+	if (!library)
+		return PYROWAVE_ERROR_SHADER_COMPILATION;
+	auto *pipeline = create_pipeline(device, library, "pyrowave_wavelet_dequant_batched", DequantThreadgroupSize);
+	if (!pipeline || pipeline.threadExecutionWidth != 32)
+		return PYROWAVE_ERROR_SHADER_COMPILATION;
+	device->bench_batched_dequant_pipeline = pipeline;
+	return PYROWAVE_SUCCESS;
+}
+
+pyrowave_result ensure_reduced_barrier_idwt_pipelines(pyrowave_device device)
+{
+	static_assert(IdwtThreadgroupSize == 64, "The reduced iDWT barrier proof requires exactly 64 threads.");
+	std::lock_guard<std::mutex> holder{device->bench_reduced_barrier_idwt_lock};
+	if (device->bench_reduced_barrier_idwt_pipeline[0] && device->bench_reduced_barrier_idwt_pipeline[1])
+		return PYROWAVE_SUCCESS;
+	const char *canonical = device->precision == 0 ? idwt_fp16_msl_source :
+	                        device->precision == 1 ? idwt_fp16_storage_msl_source : idwt_msl_source;
+	std::string source;
+	try
+	{
+		if (!build_reduced_barrier_idwt_msl(canonical, device->precision, source))
+		{
+			device->log("Canonical iDWT shader changed; the benchmark barrier experiment needs a fresh synchronization audit.");
+			return PYROWAVE_ERROR_SHADER_COMPILATION;
+		}
+	}
+	catch (const std::bad_alloc &)
+	{
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	}
+	auto *library = compile_library(device, source.c_str(), "experimental reduced-barrier idwt");
+	if (!library)
+		return PYROWAVE_ERROR_SHADER_COMPILATION;
+	id<MTLComputePipelineState> pipelines[2];
+	for (int i = 0; i < 2; i++)
+	{
+		pipelines[i] = create_pipeline_bool_constant(device, library, "pyrowave_idwt_reduced_barriers",
+		                                            IdwtThreadgroupSize, 0, i != 0);
+		if (!pipelines[i])
+			return PYROWAVE_ERROR_SHADER_COMPILATION;
+	}
+	for (int i = 0; i < 2; i++)
+		device->bench_reduced_barrier_idwt_pipeline[i] = pipelines[i];
+	return PYROWAVE_SUCCESS;
+}
+#endif
 
 bool WaveletPyramid::init(pyrowave_device device, const BlockLayout &layout)
 {
