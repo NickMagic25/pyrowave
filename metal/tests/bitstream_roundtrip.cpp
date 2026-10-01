@@ -217,6 +217,66 @@ void zeroed_encoder_payload_is_not_complete()
 	require(!parser.decode_is_ready(false), "Zeroed encoder payload was falsely marked complete");
 	require(parser.get_total_blocks_in_sequence() == 3, "Corruption lost the frame's expected block count");
 }
+
+void coefficient_scratch_covers_padded_bands()
+{
+	struct Case
+	{
+		int width;
+		int height;
+		ChromaSubsampling chroma;
+		size_t expected_blocks_8x8;
+		size_t expected_bytes;
+	};
+	// The smaller mip bands require their own 8x8 padding. In particular,
+	// 3440x1440 aligns to 3456x1440, but 108x45 at level 4 pads to 112x48.
+	// These expected capacities include all bands/components before rate control,
+	// even when the final encoded frame is limited to a much smaller byte budget.
+	const Case cases[] = {
+		{ 3440, 1440, ChromaSubsampling::Chroma420, 117162, 14996744 },
+		{ 3440, 1440, ChromaSubsampling::Chroma444, 233802, 29926664 },
+		{ 3840, 2160, ChromaSubsampling::Chroma420, 195930, 25079048 },
+		{ 3840, 2160, ChromaSubsampling::Chroma444, 391770, 50146568 },
+		{ 65, 49, ChromaSubsampling::Chroma420, 393, 50312 },
+		{ 65, 49, ChromaSubsampling::Chroma444, 777, 99464 },
+		{ 1, 1, ChromaSubsampling::Chroma420, 393, 50312 },
+		{ 1, 1, ChromaSubsampling::Chroma444, 777, 99464 },
+		{ 16384, 16384, ChromaSubsampling::Chroma420, 6291456, 805306376 },
+		{ 16384, 16384, ChromaSubsampling::Chroma444, 12582912, 1610612744 },
+	};
+	for (const auto &test : cases)
+	{
+		BlockLayout layout;
+		require(layout.init(test.width, test.height, test.chroma), "Scratch layout creation failed");
+		require(size_t(layout.block_count_8x8) == test.expected_blocks_8x8,
+		        "Known padded coefficient block count changed");
+		const size_t bytes = compute_coefficient_payload_buffer_size(layout);
+		require(bytes == test.expected_bytes, "Coefficient scratch capacity was wrong");
+		// An 8x8 block consists of eight 4x2 payloads, each with up to 14
+		// magnitude bytes and one sign byte. The first eight buffer bytes hold
+		// allocation counters rather than coefficient data.
+		require(bytes >= 8 + test.expected_blocks_8x8 * 8 * (14 + 1),
+		        "Scratch did not cover every supported sign/magnitude plane");
+		require(bytes - 8 < UINT32_MAX, "Scratch exceeds its 32-bit byte allocation counter");
+	}
+
+	BlockLayout synthetic;
+	synthetic.block_count_8x8 = -1;
+	require(compute_coefficient_payload_buffer_size(synthetic) == 0,
+	        "Negative coefficient block count was accepted");
+	// Pin both sides of the uint32 capacity boundary without creating a huge
+	// mapping or allocating its scratch. These synthetic counts exceed the
+	// current image-dimension limit and exercise the helper's defensive check.
+	synthetic.block_count_8x8 = 33554431;
+	require(compute_coefficient_payload_buffer_size(synthetic) == size_t(4294967176ull),
+	        "Last representable scratch capacity was rejected");
+	synthetic.block_count_8x8 = 33554432;
+	require(compute_coefficient_payload_buffer_size(synthetic) == 0,
+	        "First overflowing scratch capacity was accepted");
+	synthetic.block_count_8x8 = std::numeric_limits<int>::max();
+	require(compute_coefficient_payload_buffer_size(synthetic) == 0,
+	        "Maximum integer block count overflowed scratch capacity");
+}
 }
 
 int main()
@@ -233,7 +293,8 @@ int main()
 		reordered_duplicate_and_missing_packets();
 		sequence_wrap_and_replay();
 		zeroed_encoder_payload_is_not_complete();
-		std::puts("Bitstream roundtrip controls passed (3440/4K, 420/444, packet bounds, reorder/duplicates/drop, sequence wrap, corruption).");
+		coefficient_scratch_covers_padded_bands();
+		std::puts("Bitstream controls passed (3440/4K, 420/444, packet bounds, reorder/duplicates/drop, sequence wrap, corruption, coefficient scratch bounds).");
 		return 0;
 	}
 	catch (const std::exception &error)

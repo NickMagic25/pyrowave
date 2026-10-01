@@ -354,7 +354,12 @@ size_t compute_coefficient_payload_buffer_size(const BlockLayout &layout)
 	// also stores the all-discarded state). Two bytes per coefficient conservatively
 	// cover these payloads. A frame-pixel estimate misses full-resolution chroma
 	// and padding; the final compressed-byte budget cannot bound this scratch.
-	return 2 * sizeof(uint32_t) + size_t(layout.block_count_8x8) * 64 * 2;
+	constexpr size_t counter_bytes = 2 * sizeof(uint32_t);
+	constexpr size_t bytes_per_block = 64 * 2;
+	if (layout.block_count_8x8 < 0 ||
+	    size_t(layout.block_count_8x8) > (UINT32_MAX - counter_bytes) / bytes_per_block)
+		return 0;
+	return counter_bytes + size_t(layout.block_count_8x8) * bytes_per_block;
 }
 
 int compute_block_count_per_subdivision(int num_blocks)

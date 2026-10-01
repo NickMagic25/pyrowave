@@ -774,6 +774,9 @@ int run(int argc, char **argv)
 			options.worker_qos ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_DEFAULT, 0) != 0)
 		throw std::runtime_error("Failed to set worker QoS");
 	setup(resources, options, frame);
+	pyrowave_bench_encode_diagnostics fixture_diagnostics = {};
+	if (options.profile)
+		check(pyrowave_bench_get_encode_diagnostics(resources.encoder, &fixture_diagnostics), "Read fixture scratch counters");
 	if (options.batched_dequant)
 		check(pyrowave_bench_set_batched_dequant(resources.decoder, true), "Enable batched dequant");
 	if (options.reduced_idwt_barriers)
@@ -842,6 +845,12 @@ int run(int argc, char **argv)
 	std::printf("Source: %s\n", options.input.empty() ? "deterministic mixed synthetic frame" : options.input.c_str());
 	std::printf("Budget: %zu bytes (%zu after 4-byte alignment); warmup: %zu; measured frames: %zu\n",
 	            options.bytes, options.bytes & ~size_t(3), options.warmup, options.frames);
+	if (options.profile)
+		std::printf("Fixture coefficient scratch: %u / %llu bytes used; compressed scratch: %llu / %llu bytes used (setup readback).\n",
+		            fixture_diagnostics.coefficient_payload_bytes,
+		            static_cast<unsigned long long>(fixture_diagnostics.coefficient_payload_capacity_bytes),
+		            static_cast<unsigned long long>(fixture_diagnostics.bitstream_payload_words) * 4,
+		            static_cast<unsigned long long>(fixture_diagnostics.bitstream_capacity_bytes));
 	std::printf("One frame at a time; setup (including 4 priming %s), disk I/O and final output readback are excluded.\n",
 	            options.decode_only ? "decodes" : "roundtrips");
 	if (options.fps)

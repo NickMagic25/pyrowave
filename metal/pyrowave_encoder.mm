@@ -416,6 +416,12 @@ bool create_encode_buffers(pyrowave_encoder encoder)
 {
 	auto *device = encoder->device;
 	const auto &layout = encoder->layout;
+	const size_t coefficient_payload_size = compute_coefficient_payload_buffer_size(layout);
+	if (!coefficient_payload_size)
+	{
+		device->log("Coefficient payload scratch exceeds the shader allocation counter range.");
+		return false;
+	}
 
 	struct
 	{
@@ -430,7 +436,7 @@ bool create_encode_buffers(pyrowave_encoder encoder)
 		// All padded wavelet coefficients are generated before the final budget is
 		// applied, including full-resolution chroma under 444.
 		{ &encoder->payload_data,
-		  compute_coefficient_payload_buffer_size(layout), "pyrowave-payload" },
+		  coefficient_payload_size, "pyrowave-payload" },
 		{ &encoder->quant_buffer,
 		  size_t(layout.block_count_32x32) * sizeof(uint32_t), "pyrowave-quant" },
 		{ &encoder->bucket_buffer, bucket_buffer_size(layout), "pyrowave-buckets" },
