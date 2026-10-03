@@ -27,6 +27,14 @@ extern "C" pyrowave_result pyrowave_bench_get_encode_diagnostics(
 		pyrowave_encoder encoder, pyrowave_bench_encode_diagnostics *diagnostics);
 extern "C" pyrowave_result pyrowave_bench_set_batched_dequant(pyrowave_decoder decoder, bool enabled);
 extern "C" pyrowave_result pyrowave_bench_set_reduced_idwt_barriers(pyrowave_decoder decoder, bool enabled);
+extern "C" pyrowave_result pyrowave_bench_set_native_dequant(pyrowave_decoder decoder, bool enabled);
+extern "C" pyrowave_result pyrowave_bench_set_hybrid_dequant(pyrowave_decoder decoder, bool enabled);
+extern "C" pyrowave_result pyrowave_bench_set_native_idwt(pyrowave_decoder decoder, bool enabled);
+extern "C" pyrowave_result pyrowave_bench_set_fused_idwt(pyrowave_decoder decoder, bool enabled);
+extern "C" pyrowave_result pyrowave_bench_set_compact_fused_idwt(pyrowave_decoder decoder, bool enabled);
+// Direct RGB experiment. Non-null writes only the supplied RGB texture, not
+// the final Y/Cb/Cr planes. Null restores the normal three-plane output path.
+extern "C" pyrowave_result pyrowave_bench_set_rgb_output(pyrowave_decoder decoder, pyrowave_mtl_texture texture);
 extern "C" pyrowave_result pyrowave_bench_set_decode_profiling(pyrowave_decoder decoder, bool enabled);
 // Call only after the decode command buffer completes.
 extern "C" pyrowave_result pyrowave_bench_get_decode_timings(

@@ -41,8 +41,8 @@ Run the executable directly for subsequent measurements, avoiding a rebuild:
 ./cmake-build-metal/pyrowave-metal-bench --width 1920 --height 1080 \
     --chroma 444 --bytes 1000000 --frames 1000
 
-# Pace 4K 4:2:0 at 120 frames/s for 10 seconds, after one second of warmup.
-./cmake-build-metal/pyrowave-metal-bench --width 3840 --height 2160 \
+# Decode only: 4K 4:2:0 at 120 frames/s for 10 seconds, after one second of warmup.
+./cmake-build-metal/pyrowave-metal-bench --decode-only --width 3840 --height 2160 \
     --chroma 420 --bytes 1000000 --fps 120 --frames 1200 --warmup 120
 
 # Decode only: 3440x1440 at 240 frames/s for 10 seconds.
@@ -96,11 +96,11 @@ presentation. Keep input, dimensions, chroma, byte budget, precision, and GPU
 load the same when comparing runs. The `--bytes` budget applies to the codec
 payload; packet headers add overhead to the reported packetized byte count.
 
-During local verification, 3840x2160 4:2:0 completed paced 120 frames/s testing.
-A separate synthetic 4K 4:4:4 run with a 1 MB budget failed the backend's full
-frame readiness check (`Packetized frame is not complete for decoding`). The
-same failure occurred when preparing a 3440x1440 4:4:4 decode-only fixture at
-that budget. The cause remains unresolved; these 4:4:4 cases remain unverified.
+The earlier `Packetized frame is not complete for decoding` failure at large
+4:4:4 dimensions was fixed. Encoder coefficient scratch storage was undersized:
+the final compressed byte budget does not bound the intermediate coefficients
+before rate control. Storage now covers the padded coefficient blocks, and
+3440x1440 and 3840x2160 4:4:4 fixtures decode successfully with a 1 MB budget.
 
 For a CMake-only build, configure the Metal directory directly:
 
@@ -139,6 +139,8 @@ alternates variants in ABBA order on the same cached packets. `--frames` and
 `--warmup` apply **per variant**. At 240 fps, 2400 frames per variant requires
 20 seconds of measurement. CSV variant 0 is the baseline and 1 is the candidate.
 Readback follows measurement and all three decoded planes must be byte-identical.
+RGB fusion comparisons validate the final RGBA output instead, because the
+candidate writes RGB directly and does not produce final YUV planes.
 
 ```sh
 ./cmake-build-metal/pyrowave-metal-bench --decode-only \
@@ -156,7 +158,72 @@ These shader variants are experimental and remain disabled by default.
 `--batched-dequant` and `--reduced-idwt-barriers` enable individual variants for
 standalone or profiled runs; comparison mode disallows these override flags.
 
+The current reconstruction, unpacking, and offscreen rendering experiments are:
+
+| Comparison | Candidate |
+| --- | --- |
+| `native-idwt` | Balanced interior wavelet-band loads; original edge loader and lifting arithmetic |
+| `native-dequant` | Packed integer bit-plane transposition |
+| `hybrid-dequant` | Short-plane unpacking plus packed fallback |
+| `native-batched` | Balanced reconstruction plus original coefficient unpacking with band batching |
+| `combined` | Packed unpacking plus balanced reconstruction and band batching |
+| `optimized` | Hybrid unpacking plus balanced reconstruction and band batching |
+| `render` | Decode and fragment RGB conversion in one command buffer; baseline waits on the CPU between them |
+| `render-fused` | Final reconstruction writes RGB directly; baseline chains decode and fragment conversion |
+| `render-optimized` | Balanced reconstruction, band batching, and chained rendering; additionally uses final RGB fusion for 4:4:4 |
+
+`--native-idwt`, `--native-dequant`, and `--hybrid-dequant` select individual
+standalone experiments. The unpacking rewrites have not demonstrated a speedup.
+`--fused-idwt`, `--compare fused-idwt`, and `--compare compact-idwt` are rejected
+two-level reconstruction prototypes: they change rounding and strict A/B checks
+can fail. They remain available for diagnosis and are excluded from the faster
+combinations above.
+The RGB fusion checkpoint uses precision-specific UNORM conversion and passes
+4K checks across all three precisions. `render-optimized` retains fragment
+conversion for 4:2:0, whose paced fusion result did not establish a gain.
+
+Test the useful decode combination without pacing:
+
+```sh
+./cmake-build-metal/pyrowave-metal-bench --decode-only \
+    --width 3440 --height 1440 --chroma 444 --bytes 1000000 --precision 1 \
+    --frames 2400 --warmup 240 --qos interactive --compare native-batched \
+    --samples cmake-build-metal/native-batched.csv
+```
+
+Measure packet submission through offscreen RGB completion at 240 frames/s:
+
+```sh
+./cmake-build-metal/pyrowave-metal-bench --decode-only \
+    --width 3440 --height 1440 --chroma 444 --bytes 1000000 --precision 1 \
+    --fps 240 --frames 2400 --warmup 240 --qos interactive \
+    --compare render-optimized --samples cmake-build-metal/render-optimized.csv
+
+python3 script/analyze_metal_bench.py \
+    cmake-build-metal/native-batched.csv cmake-build-metal/render-optimized.csv \
+    --outputstem cmake-build-metal/variants-analysis
+```
+
+`Packet to YUV GPU end` starts immediately before decoder reset and cached packet
+parsing, and ends at the decode command buffer's GPU completion timestamp.
+It includes parsing, upload, command encoding, queue delay, and GPU work, and
+excludes the final CPU wakeup. With rendering, `Packet to RGB GPU end` ends after
+RGB conversion. `Decode wall + wait` / `Packet to RGB + wait` includes the final
+wait return as well. CSV field `packet_to_gpu_ms` records the GPU-ready interval.
+
+`--render wait` waits for decode before submitting a separate render command;
+`--render chain` puts both in one command buffer. The offscreen reference renderer
+uses full-range BT.709, nearest chroma, and RGBA8 output. These are fixed benchmark
+assumptions, not stream color metadata handling. Render comparisons never acquire
+a drawable or present to a display. Their GPU row measures the complete command
+buffer, or the sum of both GPU commands for `wait`; that sum excludes the CPU gap.
+
+The analysis script retains scheduling outliers, reports percentiles and paired
+ABBA deltas, and writes JSON and Markdown. Unpaced CSV deadline flags are zero
+because there is no scheduled deadline; they do not establish reliable playback.
+
 Worker QoS is inherited unless `--qos default` or `--qos interactive` is supplied.
 The CLI prints the actual class. Removing `--fps` tests sustained unpaced decode;
 that is a useful diagnostic, but it does not establish 240 fps scheduling behavior.
-See [the measured investigation](PERFORMANCE.md) for findings and remaining work.
+See [the first measured investigation](PERFORMANCE.md) and
+[the reconstruction and rendering experiments](DECODE_EXPERIMENTS.md) for results.

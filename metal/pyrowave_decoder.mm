@@ -121,6 +121,11 @@ struct pyrowave_decoder_opaque
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
 	bool bench_batched_dequant = false;
 	bool bench_reduced_idwt_barriers = false;
+	int bench_native_dequant = 0;
+	bool bench_native_idwt = false;
+	bool bench_fused_idwt = false;
+	bool bench_compact_fused_idwt = false;
+	id<MTLTexture> bench_rgb_output;
 	bool bench_profiling = false;
 	UploadSlot *bench_last_profile_slot = nullptr;
 	pyrowave_bench_decode_timings bench_timings = empty_bench_timings();
@@ -168,7 +173,12 @@ void encode_dequant(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc, 
 {
 	auto &layout = decoder->layout;
 
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+	[enc setComputePipelineState:decoder->bench_native_dequant ?
+	                           decoder->device->bench_native_dequant_pipeline[decoder->bench_native_dequant - 1] : decoder->device->dequant_pipeline];
+#else
 	[enc setComputePipelineState:decoder->device->dequant_pipeline];
+#endif
 	// The u8/u16/u32 aliases of the payload collapse into a single binding in MSL.
 	[enc setBuffer:slot->payload offset:0 atIndex:0];
 	[enc setBuffer:slot->offsets offset:0 atIndex:2];
@@ -205,7 +215,8 @@ void encode_dequant(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc, 
 void encode_dequant_batched(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc, UploadSlot *slot)
 {
 	const auto &layout = decoder->layout;
-	[enc setComputePipelineState:decoder->device->bench_batched_dequant_pipeline];
+	[enc setComputePipelineState:decoder->bench_native_dequant ?
+	                           decoder->device->bench_native_batched_dequant_pipeline[decoder->bench_native_dequant - 1] : decoder->device->bench_batched_dequant_pipeline];
 	[enc setBuffer:slot->payload offset:0 atIndex:0];
 	[enc setBuffer:slot->offsets offset:0 atIndex:2];
 
@@ -243,7 +254,9 @@ void encode_idwt_dispatch(pyrowave_decoder decoder, id<MTLComputeCommandEncoder>
                           bool dc_shift)
 {
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
-	if (decoder->bench_reduced_idwt_barriers)
+	if (decoder->bench_native_idwt)
+		[enc setComputePipelineState:decoder->device->bench_native_idwt_pipeline[dc_shift ? 1 : 0]];
+	else if (decoder->bench_reduced_idwt_barriers)
 		[enc setComputePipelineState:decoder->device->bench_reduced_barrier_idwt_pipeline[dc_shift ? 1 : 0]];
 	else
 #endif
@@ -262,6 +275,10 @@ void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
 {
 	auto &layout = decoder->layout;
 	const bool chroma_420 = layout.chroma == ChromaSubsampling::Chroma420;
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+	const bool fused = decoder->bench_fused_idwt && !decoder->bench_rgb_output &&
+	                   layout.level_width(0) >= 32 && layout.level_height(0) >= 32;
+#endif
 
 	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
 	{
@@ -280,11 +297,45 @@ void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
 
 		if (input_level == 0)
 		{
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+			if (decoder->bench_rgb_output)
+			{
+				[enc setComputePipelineState:decoder->device->bench_rgb_idwt_pipeline[chroma_420]];
+				[enc setBytes:&push length:sizeof(push) atIndex:0];
+				for (int c = 0; c < NumComponents; c++)
+					[enc setTexture:chroma_420 && c != 0 ? planes[c] : decoder->wavelet.component_layer_views[c][0] atIndex:c];
+				[enc setTexture:decoder->bench_rgb_output atIndex:3];
+				[enc setSamplerState:decoder->device->mirror_repeat_sampler atIndex:0];
+				[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 15) / 16, (push.resolution[1] + 15) / 16, 1)
+				      threadsPerThreadgroup:MTLSizeMake(IdwtThreadgroupSize, 1, 1)];
+				continue;
+			}
+#endif
 			// Final level writes the output planes directly. Under 420 the chroma
 			// planes were already finished one level earlier.
 			const int components = chroma_420 ? 1 : NumComponents;
 			for (int c = 0; c < components; c++)
 			{
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+				if (fused)
+				{
+					struct { IdwtPush fine; IdwtPush coarse; } constants = {};
+					constants.fine = push;
+					constants.coarse.resolution[0] = layout.level_height(1);
+					constants.coarse.resolution[1] = layout.level_width(1);
+					constants.coarse.inv_resolution[0] = 1.0f / float(constants.coarse.resolution[0]);
+					constants.coarse.inv_resolution[1] = 1.0f / float(constants.coarse.resolution[1]);
+					[enc setComputePipelineState:decoder->device->bench_fused_idwt_pipeline[decoder->bench_compact_fused_idwt]];
+					[enc setBytes:&constants length:sizeof(constants) atIndex:0];
+					[enc setTexture:decoder->wavelet.component_layer_views[c][1] atIndex:0];
+					[enc setTexture:decoder->wavelet.component_layer_views[c][0] atIndex:1];
+					[enc setTexture:planes[c] atIndex:2];
+					[enc setSamplerState:decoder->device->mirror_repeat_sampler atIndex:0];
+					[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 15) / 16, (push.resolution[1] + 15) / 16, 1)
+					      threadsPerThreadgroup:MTLSizeMake(IdwtThreadgroupSize, 1, 1)];
+					continue;
+				}
+#endif
 				encode_idwt_dispatch(decoder, enc, push,
 				                     decoder->wavelet.component_layer_views[c][input_level],
 				                     planes[c], true);
@@ -294,6 +345,9 @@ void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
 		{
 			for (int c = 0; c < NumComponents; c++)
 			{
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+				if (fused && input_level == 1 && (!chroma_420 || c == 0)) continue;
+#endif
 				const bool final_chroma = chroma_420 && c != 0 && input_level == 1;
 				id<MTLTexture> output = final_chroma ?
 				                       planes[c] :
@@ -552,6 +606,65 @@ pyrowave_result pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 }
 
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
+extern "C" pyrowave_result pyrowave_bench_set_native_dequant(pyrowave_decoder decoder, bool enabled)
+{
+	if (!decoder) return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	if (enabled) { auto result = ensure_native_dequant_pipelines(decoder->device); if (result != PYROWAVE_SUCCESS) return result; }
+	decoder->bench_native_dequant = enabled;
+	return PYROWAVE_SUCCESS;
+}
+
+extern "C" pyrowave_result pyrowave_bench_set_hybrid_dequant(pyrowave_decoder decoder, bool enabled)
+{
+	if (!decoder) return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	if (enabled) { auto result = ensure_native_dequant_pipelines(decoder->device, true); if (result != PYROWAVE_SUCCESS) return result; }
+	decoder->bench_native_dequant = enabled ? 2 : 0;
+	return PYROWAVE_SUCCESS;
+}
+
+extern "C" pyrowave_result pyrowave_bench_set_native_idwt(pyrowave_decoder decoder, bool enabled)
+{
+	if (!decoder) return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	if (enabled) { auto result = ensure_native_idwt_pipelines(decoder->device); if (result != PYROWAVE_SUCCESS) return result; }
+	decoder->bench_native_idwt = enabled;
+	return PYROWAVE_SUCCESS;
+}
+
+extern "C" pyrowave_result pyrowave_bench_set_fused_idwt(pyrowave_decoder decoder, bool enabled)
+{
+	if (!decoder) return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	if (enabled) { auto result = ensure_fused_idwt_pipeline(decoder->device); if (result != PYROWAVE_SUCCESS) return result; }
+	decoder->bench_fused_idwt = enabled;
+	decoder->bench_compact_fused_idwt = false;
+	return PYROWAVE_SUCCESS;
+}
+
+extern "C" pyrowave_result pyrowave_bench_set_compact_fused_idwt(pyrowave_decoder decoder, bool enabled)
+{
+	if (!decoder) return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	if (enabled) { auto result = ensure_fused_idwt_pipeline(decoder->device, true); if (result != PYROWAVE_SUCCESS) return result; }
+	decoder->bench_fused_idwt = enabled;
+	decoder->bench_compact_fused_idwt = enabled;
+	return PYROWAVE_SUCCESS;
+}
+
+extern "C" pyrowave_result pyrowave_bench_set_rgb_output(pyrowave_decoder decoder, pyrowave_mtl_texture texture)
+{
+	if (!decoder)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	auto output = (__bridge id<MTLTexture>)texture;
+	if (texture)
+	{
+		if (output.width != NSUInteger(decoder->layout.width) || output.height != NSUInteger(decoder->layout.height) ||
+		    output.pixelFormat != MTLPixelFormatRGBA8Unorm || !(output.usage & MTLTextureUsageShaderWrite))
+			return PYROWAVE_ERROR_INVALID_ARGUMENT;
+		auto result = ensure_rgb_idwt_pipeline(decoder->device, decoder->layout.chroma == ChromaSubsampling::Chroma420);
+		if (result != PYROWAVE_SUCCESS) return result;
+	}
+	decoder->bench_rgb_output = output;
+	return PYROWAVE_SUCCESS;
+}
+
 extern "C" pyrowave_result pyrowave_bench_set_batched_dequant(pyrowave_decoder decoder, bool enabled)
 {
 	if (!decoder)

@@ -1,10 +1,15 @@
 # Metal decode investigation, 2026-09-30
 
+Follow-up: [reconstruction, unpacking, fusion, and rendering experiments](DECODE_EXPERIMENTS.md),
+2026-10-03. The results below describe the first investigation.
+
 On this Apple M3, the first experiments produce small decode improvements rather
 than a substantial reduction at 240 fps. Band batching is the strongest result
 so far: roughly 10 microseconds less GPU time under sustained load. Private
 output textures show no convincing benefit. All experiments remain optional in
-the CLI's private backend; the shared library and its default shaders are unchanged.
+the CLI's private backend; the shared library's default decode shaders are unchanged.
+The subsequent encoder scratch-allocation correctness fix also applies to the
+shared library.
 
 ## Measurement
 
@@ -138,10 +143,14 @@ and flat 64x64 420 fixtures at precisions 0, 1, and 2, with repeated variant
 switching. These are full-frame synthetic/fixture checks; changing streams,
 partial packets, and real client playback remain outside validation.
 
-A synthetic 1920x1080 444 fixture with a 1 MB budget failed full-frame readiness
-before timing, as did the previously attempted 3440x1440 and 4K 444 fixtures at
-that budget. The backend cause remains unresolved. Those cases cannot be used
-to accept these experiments.
+At the time of this investigation, synthetic 1920x1080, 3440x1440, and 4K 444
+fixtures with a 1 MB budget failed full-frame readiness before timing. This was
+subsequently fixed: encoder intermediate coefficient scratch storage must cover
+the padded coefficient blocks before rate control, rather than depend on the
+final compressed byte budget. For 3440x1440 444, a diagnostic measured 10,151,561
+coefficient bytes against the old 9,953,272-byte allocation; the corrected bound
+allocates 29,926,656 bytes. Large 444 validation and measurements are now recorded
+in the follow-up report.
 
 The next priorities are:
 

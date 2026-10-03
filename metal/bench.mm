@@ -7,6 +7,7 @@
 
 #include "pyrowave_metal.h"
 #include "pyrowave_bench.h"
+#include "experimental_render.msl.h"
 #include <mach/mach_time.h>
 #include <pthread.h>
 
@@ -46,6 +47,11 @@ struct Options
 	bool profile = false;
 	bool batched_dequant = false;
 	bool reduced_idwt_barriers = false;
+	bool native_dequant = false;
+	bool hybrid_dequant = false;
+	bool native_idwt = false;
+	bool fused_idwt = false;
+	std::string render = "none";
 	int worker_qos = -1;
 	std::string compare;
 	std::string samples_path;
@@ -65,8 +71,14 @@ void usage(const char *program)
 	            "  --output-storage shared|private (default shared)\n"
 	            "  --batched-dequant     Experimental band batching\n"
 	            "  --reduced-idwt-barriers  Experimental redundant apron barrier removal\n"
+	            "  --native-dequant      Experimental packed bit-plane unpacking\n"
+	            "  --hybrid-dequant      Experimental short-plane unpacking\n"
+	            "  --native-idwt         Experimental balanced reconstruction loads\n"
+	            "  --fused-idwt          Diagnostic two-level fusion (not bit-identical)\n"
+	            "  --render none|wait|chain  Offscreen BT.709 RGB render (default none)\n"
 	            "  --profile             Include CPU phases and GPU pass counters\n"
-	            "  --compare output|dequant|idwt  Interleave variants on one bitstream\n"
+	            "  --compare output|dequant|idwt|native-dequant|hybrid-dequant|native-idwt|fused-idwt|compact-idwt|combined|optimized|native-batched|render|render-fused|render-optimized\n"
+	            "                        Interleave variants on one cached bitstream\n"
 	            "  --qos default|interactive (default inherited)\n"
 	            "  --samples FILE.csv    Save measured samples after timing\n"
 	            "  --bytes N             Encoder frame budget in bytes (default 500000)\n"
@@ -112,6 +124,14 @@ bool parse_options(int argc, char **argv, Options &options)
 			else options.reduced_idwt_barriers = true;
 			continue;
 		}
+		if (arg == "--native-dequant" || arg == "--hybrid-dequant" || arg == "--native-idwt" || arg == "--fused-idwt")
+		{
+			if (arg == "--native-dequant") options.native_dequant = true;
+			else if (arg == "--hybrid-dequant") options.hybrid_dequant = true;
+			else if (arg == "--native-idwt") options.native_idwt = true;
+			else options.fused_idwt = true;
+			continue;
+		}
 		if (i + 1 == argc)
 			throw std::runtime_error("Missing value for " + arg);
 		const std::string value = argv[++i];
@@ -155,9 +175,18 @@ bool parse_options(int argc, char **argv, Options &options)
 		}
 		else if (arg == "--compare")
 		{
-			if (value != "output" && value != "dequant" && value != "idwt")
-				throw std::runtime_error("--compare must be output, dequant, or idwt");
+			if (value != "output" && value != "dequant" && value != "idwt" &&
+			    value != "native-dequant" && value != "hybrid-dequant" && value != "native-idwt" && value != "fused-idwt" &&
+			    value != "compact-idwt" && value != "combined" && value != "optimized" && value != "native-batched" &&
+			    value != "render" && value != "render-fused" && value != "render-optimized")
+				throw std::runtime_error("Unknown --compare variant");
 			options.compare = value;
+		}
+		else if (arg == "--render")
+		{
+			if (value != "none" && value != "wait" && value != "chain")
+				throw std::runtime_error("--render must be none, wait, or chain");
+			options.render = value;
 		}
 		else if (arg == "--samples") options.samples_path = value;
 		else if (arg == "--qos")
@@ -173,8 +202,15 @@ bool parse_options(int argc, char **argv, Options &options)
 		throw std::runtime_error("--frames must be at least 1");
 	if (options.bytes < 4)
 		throw std::runtime_error("--bytes must be at least 4");
-	if (!options.compare.empty() && (!options.decode_only || options.profile || options.batched_dequant || options.reduced_idwt_barriers))
+	if (!options.compare.empty() && (!options.decode_only || options.profile || options.batched_dequant || options.reduced_idwt_barriers ||
+	                              options.native_dequant || options.native_idwt || options.fused_idwt))
 		throw std::runtime_error("--compare requires --decode-only and cannot combine with profiling or shader override flags");
+	if (!options.compare.empty() && options.hybrid_dequant)
+		throw std::runtime_error("--compare cannot combine with --hybrid-dequant");
+	if (options.native_dequant && options.hybrid_dequant)
+		throw std::runtime_error("Select only one unpacking override");
+	if (options.compare == "render" || options.compare == "render-fused" || options.compare == "render-optimized")
+		options.render = "chain";
 	if (options.precision < 0)
 	{
 		const char *env = std::getenv("PYROWAVE_PRECISION");
@@ -328,6 +364,11 @@ struct Resources
 	id<MTLCommandQueue> queue;
 	id<MTLTexture> output[3];
 	id<MTLTexture> alternate_output[3];
+	id<MTLRenderPipelineState> render_pipeline;
+	id<MTLTexture> render_output[2];
+	size_t variant = 0;
+	bool render_wait = false;
+	bool render_fused = false;
 	pyrowave_cpu_buffer cpu_input = {};
 	pyrowave_gpu_input gpu_input = {};
 	pyrowave_gpu_buffers gpu_output = {};
@@ -395,6 +436,46 @@ void finish_encode(Resources &resources, size_t &raw_size, size_t &metadata_size
 	      "Wait for encoded frame");
 }
 
+void setup_render(Resources &resources, const Options &options)
+{
+	if (options.render == "none") return;
+	resources.render_wait = options.render == "wait";
+	NSError *error = nil;
+	auto source = PyroWave::bench_render_source();
+	auto library = [resources.metal_device newLibraryWithSource:@(source.c_str()) options:nil error:&error];
+	if (!library) throw std::runtime_error(std::string("Render shader compilation: ") + error.localizedDescription.UTF8String);
+	auto descriptor = [MTLRenderPipelineDescriptor new];
+	descriptor.vertexFunction = [library newFunctionWithName:@"bench_fullscreen"];
+	descriptor.fragmentFunction = [library newFunctionWithName:@"bench_rgb_fragment"];
+	descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	resources.render_pipeline = [resources.metal_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+	if (!resources.render_pipeline) throw std::runtime_error(std::string("Render pipeline: ") + error.localizedDescription.UTF8String);
+	auto texture = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                                width:options.width height:options.height mipmapped:NO];
+	texture.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite;
+	texture.storageMode = MTLStorageModeShared;
+	for (int i = 0; i < (options.compare.empty() ? 1 : 2); i++)
+	{
+		resources.render_output[i] = [resources.metal_device newTextureWithDescriptor:texture];
+		if (!resources.render_output[i]) throw std::runtime_error("Failed to allocate RGB output");
+	}
+}
+
+void encode_render(Resources &resources, id<MTLCommandBuffer> command)
+{
+	auto descriptor = [MTLRenderPassDescriptor renderPassDescriptor];
+	descriptor.colorAttachments[0].texture = resources.render_output[resources.variant];
+	descriptor.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+	descriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
+	auto encoder = [command renderCommandEncoderWithDescriptor:descriptor];
+	if (!encoder) throw std::runtime_error("Failed to create RGB render encoder");
+	[encoder setRenderPipelineState:resources.render_pipeline];
+	for (int i = 0; i < 3; i++)
+		[encoder setFragmentTexture:(__bridge id<MTLTexture>)resources.gpu_output.planes[i] atIndex:i];
+	[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[encoder endEncoding];
+}
+
 void setup(Resources &resources, const Options &options, Frame &frame)
 {
 	const std::string precision = std::to_string(options.precision);
@@ -427,7 +508,7 @@ void setup(Resources &resources, const Options &options, Frame &frame)
 			create_surface(resources, plane, i);
 		auto *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
 		                                                                         width:plane.width height:plane.height mipmapped:NO];
-		descriptor.usage = MTLTextureUsageShaderWrite;
+		descriptor.usage = MTLTextureUsageShaderWrite | (options.render != "none" ? MTLTextureUsageShaderRead : 0);
 		descriptor.storageMode = options.private_output ? MTLStorageModePrivate : MTLStorageModeShared;
 		resources.output[i] = [resources.metal_device newTextureWithDescriptor:descriptor];
 		if (!resources.output[i])
@@ -453,6 +534,7 @@ void setup(Resources &resources, const Options &options, Frame &frame)
 	if (!count)
 		throw std::runtime_error("Encoder produced no frame packets");
 	resources.packets.resize(count);
+	setup_render(resources, options);
 }
 
 double milliseconds(Clock::time_point start, Clock::time_point end)
@@ -483,6 +565,7 @@ struct Sample
 	double commit_cpu = 0.0;
 	double commit_to_gpu = 0.0;
 	double gpu_to_return = 0.0;
+	double packet_to_gpu = 0.0;
 	pyrowave_bench_decode_timings stages = {
 		std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
 		std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
@@ -523,6 +606,7 @@ Sample run_sample(Resources &resources, const Options &options)
 		sample.packetize = milliseconds(packet_begin, Clock::now());
 	}
 
+	const double decode_begin_host = host_seconds();
 	const auto decode_begin = Clock::now();
 	pyrowave_decoder_clear(resources.decoder);
 	for (size_t i = 0; i < resources.packet_count; i++)
@@ -543,25 +627,50 @@ Sample run_sample(Resources &resources, const Options &options)
 		throw std::runtime_error("Failed to create decode command buffer");
 	check(pyrowave_decoder_decode_gpu_buffer(resources.decoder, (__bridge void *)command, &resources.gpu_output),
 	      "Encode decode commands");
+	if (options.render != "none" && !resources.render_wait && !resources.render_fused)
+		encode_render(resources, command);
 	const auto encoded_commands = Clock::now();
 	const double commit_host = host_seconds();
 	[command commit];
 	const auto committed = Clock::now();
 	[command waitUntilCompleted];
-	const double return_host = host_seconds();
-	const auto decoded = Clock::now();
-	sample.completed = decoded;
+	double gpu_time = (command.GPUEndTime - command.GPUStartTime) * 1000.0;
+	double final_gpu_end = command.GPUEndTime;
+	double render_commands_cpu = 0.0, render_commit_cpu = 0.0;
 	if (command.status != MTLCommandBufferStatusCompleted)
 		throw std::runtime_error(std::string("Decode command buffer failed: ") +
 		                         (command.error.localizedDescription.UTF8String ?: "unknown error"));
-	sample.decode_gpu = (command.GPUEndTime - command.GPUStartTime) * 1000.0;
+	if (options.render != "none" && resources.render_wait)
+	{
+		const auto render_begin = Clock::now();
+		auto render_command = [resources.queue commandBuffer];
+		if (!render_command) throw std::runtime_error("Failed to create render command buffer");
+		encode_render(resources, render_command);
+		const auto render_encoded = Clock::now();
+		[render_command commit];
+		const auto render_committed = Clock::now();
+		[render_command waitUntilCompleted];
+		if (render_command.status != MTLCommandBufferStatusCompleted)
+			throw std::runtime_error(std::string("RGB render command buffer failed: ") +
+			                         (render_command.error.localizedDescription.UTF8String ?: "unknown error"));
+		render_commands_cpu = milliseconds(render_begin, render_encoded);
+		render_commit_cpu = milliseconds(render_encoded, render_committed);
+		gpu_time += (render_command.GPUEndTime - render_command.GPUStartTime) * 1000.0;
+		final_gpu_end = render_command.GPUEndTime;
+	}
+	const double return_host = host_seconds();
+	const auto decoded = Clock::now();
+	sample.completed = decoded;
+	sample.decode_gpu = gpu_time;
 	sample.parse_cpu = milliseconds(decode_begin, parsed);
-	sample.encode_commands_cpu = milliseconds(parsed, encoded_commands);
-	sample.commit_cpu = milliseconds(encoded_commands, committed);
+	sample.encode_commands_cpu = milliseconds(parsed, encoded_commands) + render_commands_cpu;
+	sample.commit_cpu = milliseconds(encoded_commands, committed) + render_commit_cpu;
 	sample.commit_to_gpu = command.GPUStartTime > 0.0 && command.GPUStartTime >= commit_host ?
 	                       (command.GPUStartTime - commit_host) * 1000.0 : std::numeric_limits<double>::quiet_NaN();
-	sample.gpu_to_return = command.GPUEndTime > 0.0 && return_host >= command.GPUEndTime ?
-	                       (return_host - command.GPUEndTime) * 1000.0 : std::numeric_limits<double>::quiet_NaN();
+	sample.gpu_to_return = final_gpu_end > 0.0 && return_host >= final_gpu_end ?
+	                       (return_host - final_gpu_end) * 1000.0 : std::numeric_limits<double>::quiet_NaN();
+	sample.packet_to_gpu = final_gpu_end > decode_begin_host ?
+	                       (final_gpu_end - decode_begin_host) * 1000.0 : std::numeric_limits<double>::quiet_NaN();
 	sample.decode_wall = milliseconds(decode_begin, decoded);
 	sample.roundtrip = options.decode_only ? sample.decode_wall : milliseconds(begin, decoded);
 	if (options.profile)
@@ -663,24 +772,70 @@ void validate_output(const DecodedPlanes &decoded, const Frame &frame)
 
 void select_variant(Resources &resources, const Options &options, size_t variant)
 {
+	resources.variant = variant;
 	for (int i = 0; i < 3; i++)
 		resources.gpu_output.planes[i] = (__bridge void *)(variant ? resources.alternate_output[i] : resources.output[i]);
 	if (options.compare == "dequant")
 		check(pyrowave_bench_set_batched_dequant(resources.decoder, variant != 0), "Select dequant variant");
 	else if (options.compare == "idwt")
 		check(pyrowave_bench_set_reduced_idwt_barriers(resources.decoder, variant != 0), "Select IDWT variant");
+	else if (options.compare == "native-dequant")
+		check(pyrowave_bench_set_native_dequant(resources.decoder, variant != 0), "Select native dequant");
+	else if (options.compare == "hybrid-dequant")
+		check(pyrowave_bench_set_hybrid_dequant(resources.decoder, variant != 0), "Select hybrid dequant");
+	else if (options.compare == "native-idwt")
+		check(pyrowave_bench_set_native_idwt(resources.decoder, variant != 0), "Select native IDWT");
+	else if (options.compare == "fused-idwt")
+		check(pyrowave_bench_set_fused_idwt(resources.decoder, variant != 0), "Select fused IDWT");
+	else if (options.compare == "compact-idwt")
+		check(pyrowave_bench_set_compact_fused_idwt(resources.decoder, variant != 0), "Select compact fused IDWT");
+	else if (options.compare == "combined")
+	{
+		check(pyrowave_bench_set_native_dequant(resources.decoder, variant != 0), "Select packed unpacking");
+		check(pyrowave_bench_set_native_idwt(resources.decoder, variant != 0), "Select balanced reconstruction");
+		check(pyrowave_bench_set_batched_dequant(resources.decoder, variant != 0), "Select band batching");
+	}
+	else if (options.compare == "optimized")
+	{
+		check(pyrowave_bench_set_hybrid_dequant(resources.decoder, variant != 0), "Select short-plane unpacking");
+		check(pyrowave_bench_set_native_idwt(resources.decoder, variant != 0), "Select balanced reconstruction");
+		check(pyrowave_bench_set_batched_dequant(resources.decoder, variant != 0), "Select band batching");
+	}
+	else if (options.compare == "native-batched")
+	{
+		check(pyrowave_bench_set_native_idwt(resources.decoder, variant != 0), "Select balanced reconstruction");
+		check(pyrowave_bench_set_batched_dequant(resources.decoder, variant != 0), "Select band batching");
+	}
+	else if (options.compare == "render") resources.render_wait = variant == 0;
+	else if (options.compare == "render-fused")
+	{
+		resources.render_fused = variant != 0;
+		check(pyrowave_bench_set_rgb_output(resources.decoder,
+		      variant ? (__bridge void *)resources.render_output[variant] : nullptr), "Select fused RGB output");
+	}
+	else if (options.compare == "render-optimized")
+	{
+		resources.render_wait = variant == 0;
+		// Paced 420 fusion has not established a gain. Keep fragment conversion
+		// there; 444 reconstructs all three components directly into RGB.
+		resources.render_fused = variant != 0 && !options.chroma_420;
+		check(pyrowave_bench_set_native_idwt(resources.decoder, variant != 0), "Select balanced reconstruction");
+		check(pyrowave_bench_set_batched_dequant(resources.decoder, variant != 0), "Select band batching");
+		check(pyrowave_bench_set_rgb_output(resources.decoder, resources.render_fused ?
+		      (__bridge void *)resources.render_output[variant] : nullptr), "Select RGB output path");
+	}
 }
 
 struct DecodeMetrics
 {
-	Metric gpu, wall, parse, commands, commit, queue, returned, late;
+	Metric gpu, wall, ready, parse, commands, commit, queue, returned, late;
 	Metric upload, dequant_cpu, idwt_cpu, dequant_gpu, idwt_gpu;
 	size_t count = 0, misses = 0, over_budget = 0;
 	double worst_wall = 0.0;
 
 	void reserve(size_t size)
 	{
-		for (auto *metric : { &gpu, &wall, &parse, &commands, &commit, &queue, &returned, &late,
+		for (auto *metric : { &gpu, &wall, &ready, &parse, &commands, &commit, &queue, &returned, &late,
 		                     &upload, &dequant_cpu, &idwt_cpu, &dequant_gpu, &idwt_gpu })
 			metric->values.reserve(size);
 	}
@@ -689,6 +844,7 @@ struct DecodeMetrics
 	{
 		count++;
 		gpu.add(sample.decode_gpu); wall.add(sample.decode_wall);
+		ready.add(sample.packet_to_gpu);
 		parse.add(sample.parse_cpu); commands.add(sample.encode_commands_cpu); commit.add(sample.commit_cpu);
 		queue.add(sample.commit_to_gpu); returned.add(sample.gpu_to_return); late.add(lateness, true);
 		worst_wall = std::max(worst_wall, sample.decode_wall);
@@ -710,7 +866,9 @@ struct DecodeMetrics
 	{
 		std::printf("\n%s (%zu samples)\n", label, count);
 		std::printf("%-24s %10s %10s %10s %10s %11s\n", "Time (ms)", "avg", "p50", "p95", "p99", "equiv FPS");
-		gpu.report("Decode GPU command", count); wall.report("Decode wall + wait", count);
+		gpu.report(options.render == "none" ? "Decode GPU command" : "Decode + RGB GPU", count);
+		ready.report(options.render == "none" ? "Packet to YUV GPU end" : "Packet to RGB GPU end", count);
+		wall.report(options.render == "none" ? "Decode wall + wait" : "Packet to RGB + wait", count);
 		parse.report("Parse CPU", count); commands.report("Encode commands CPU", count);
 		commit.report("Commit CPU", count); queue.report("Commit to GPU start", count);
 		returned.report("GPU end to CPU return", count);
@@ -741,15 +899,15 @@ void write_samples(const std::string &path, const std::vector<RecordedSample> &r
 	using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
 	File file(std::fopen(path.c_str(), "wb"), std::fclose);
 	if (!file) throw std::runtime_error("Cannot create sample CSV: " + path);
-	std::fprintf(file.get(), "index,variant,decode_gpu_ms,decode_wall_ms,parse_cpu_ms,commands_cpu_ms,commit_cpu_ms,commit_to_gpu_ms,gpu_to_return_ms,start_late_ms,deadline_missed,upload_cpu_ms,dequant_cpu_ms,idwt_cpu_ms,dequant_gpu_ms,idwt_gpu_ms\n");
+	std::fprintf(file.get(), "index,variant,decode_gpu_ms,decode_wall_ms,parse_cpu_ms,commands_cpu_ms,commit_cpu_ms,commit_to_gpu_ms,gpu_to_return_ms,start_late_ms,deadline_missed,upload_cpu_ms,dequant_cpu_ms,idwt_cpu_ms,dequant_gpu_ms,idwt_gpu_ms,packet_to_gpu_ms\n");
 	for (const auto &record : records)
 	{
 		const auto &s = record.sample;
-		std::fprintf(file.get(), "%zu,%zu,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%d,%.9f,%.9f,%.9f,%.9f,%.9f\n",
+		std::fprintf(file.get(), "%zu,%zu,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
 		             record.index, record.variant, s.decode_gpu, s.decode_wall, s.parse_cpu, s.encode_commands_cpu,
 		             s.commit_cpu, s.commit_to_gpu, s.gpu_to_return, record.lateness, int(record.missed),
 		             s.stages.upload_cpu_ms, s.stages.dequant_encode_cpu_ms, s.stages.idwt_encode_cpu_ms,
-		             s.stages.dequant_gpu_ms, s.stages.idwt_gpu_ms);
+		             s.stages.dequant_gpu_ms, s.stages.idwt_gpu_ms, s.packet_to_gpu);
 	}
 	if (std::fflush(file.get()) || std::ferror(file.get()))
 		throw std::runtime_error("Failed to write sample CSV");
@@ -781,6 +939,10 @@ int run(int argc, char **argv)
 		check(pyrowave_bench_set_batched_dequant(resources.decoder, true), "Enable batched dequant");
 	if (options.reduced_idwt_barriers)
 		check(pyrowave_bench_set_reduced_idwt_barriers(resources.decoder, true), "Enable reduced IDWT barriers");
+	if (options.native_dequant) check(pyrowave_bench_set_native_dequant(resources.decoder, true), "Enable native dequant");
+	if (options.hybrid_dequant) check(pyrowave_bench_set_hybrid_dequant(resources.decoder, true), "Enable hybrid dequant");
+	if (options.native_idwt) check(pyrowave_bench_set_native_idwt(resources.decoder, true), "Enable native IDWT");
+	if (options.fused_idwt) check(pyrowave_bench_set_fused_idwt(resources.decoder, true), "Enable fused IDWT");
 	if (options.profile)
 		check(pyrowave_bench_set_decode_profiling(resources.decoder, true), "Enable decode profiling");
 	if (options.decode_only)
@@ -814,6 +976,9 @@ int run(int argc, char **argv)
 	            options.private_output ? "private" : "shared", options.batched_dequant ? "batched" : "original",
 	            options.reduced_idwt_barriers ? "reduced" : "original",
 	            options.profile ? "enabled (diagnostic timing)" : "disabled", unsigned(current_qos));
+	std::printf("Reconstruction: %s; unpacking: %s; two-level fusion: %s; offscreen RGB: %s.\n",
+	            options.native_idwt ? "balanced" : "original", options.hybrid_dequant ? "hybrid" : options.native_dequant ? "packed" : "original",
+	            options.fused_idwt ? "enabled" : "disabled", options.render.c_str());
 	if (!options.compare.empty())
 	{
 		std::printf("A/B: %s; %zu measured frames PER variant; alternating ABBA frame order on the same bitstream.\n",
@@ -821,9 +986,18 @@ int run(int argc, char **argv)
 		if (options.compare == "output")
 			std::printf("Baseline: %s output; candidate: %s output.\n",
 			            options.private_output ? "private" : "shared", options.private_output ? "shared" : "private");
+		else if (options.compare == "render")
+			std::printf("Baseline: CPU wait then separate RGB render; candidate: decode and RGB render in one command buffer.\n");
+		else if (options.compare == "render-fused")
+			std::printf("Baseline: decode + fragment RGB; candidate: fused final reconstruction + RGB.\n");
+		else if (options.compare == "render-optimized")
+			std::printf("Baseline: original decode, CPU wait, fragment RGB; candidate: balanced reconstruction, band batching, one command buffer%s.\n",
+			            options.chroma_420 ? ", fragment RGB" : ", fused final reconstruction + RGB");
+		else if (options.compare == "native-batched")
+			std::printf("Baseline: original decode; candidate: balanced reconstruction and canonical band batching.\n");
 		else
 			std::printf("Baseline: original shader; candidate: %s.\n",
-			            options.compare == "dequant" ? "batched dequant" : "reduced IDWT barriers");
+			            options.compare.c_str());
 	}
 	if (options.decode_only)
 	{
@@ -942,16 +1116,65 @@ int run(int argc, char **argv)
 	std::printf("Frame payload: %.1f bytes avg, %zu min, %zu max (including bitstream headers)\n",
 	            payload_sum / double(measured_iterations), payload_min, payload_max);
 	std::printf("GPU rows measure complete command buffers; wall rows include submission and synchronization.\n");
+	std::printf("Packet-to-output starts before parsing cached packets and ends at GPU completion; no network arrival gaps are simulated.\n");
+	if (options.render != "none")
+		std::printf("Render-wait GPU time sums decode and render commands; its queue row covers the first submission only.\n");
 	std::printf("Commit CPU overlaps the commit-to-GPU interval; diagnostic counters may perturb GPU timing.\n");
 	std::printf("Equivalent FPS is 1000 / mean stage time, not video playback throughput.\n");
 	const auto baseline_pixels = read_output(resources, frame, resources.output);
 	validate_output(baseline_pixels, frame);
 	if (variant_count == 2)
 	{
-		const auto candidate_pixels = read_output(resources, frame, resources.alternate_output);
-		if (candidate_pixels != baseline_pixels)
-			throw std::runtime_error("A/B decoded output differs: candidate is not bit-identical to baseline");
-		std::printf("A/B output: bit-identical on all three planes.\n");
+		if (options.compare != "render-fused" && !(options.compare == "render-optimized" && !options.chroma_420))
+		{
+			const auto candidate_pixels = read_output(resources, frame, resources.alternate_output);
+			if (candidate_pixels != baseline_pixels)
+			{
+				for (int plane = 0; plane < 3; plane++)
+				{
+					size_t differing = 0, first = SIZE_MAX; int maximum = 0;
+					for (size_t i = 0; i < baseline_pixels[plane].size(); i++)
+					{
+						int d = std::abs(int(baseline_pixels[plane][i]) - int(candidate_pixels[plane][i]));
+						if (d && first == SIZE_MAX) first = i;
+						differing += d != 0; maximum = std::max(maximum, d);
+					}
+					std::fprintf(stderr, "Plane %d: %zu differing pixels, max %d LSB, first at (%zu,%zu)\n",
+					             plane, differing, maximum, first == SIZE_MAX ? 0 : first % frame.planes[plane].width,
+					             first == SIZE_MAX ? 0 : first / frame.planes[plane].width);
+					if (differing && !options.samples_path.empty())
+						for (int variant = 0; variant < 2; variant++)
+						{
+							auto path = options.samples_path + ".plane" + std::to_string(plane) + (variant ? ".candidate.bin" : ".baseline.bin");
+							auto file = std::unique_ptr<FILE, decltype(&std::fclose)>(std::fopen(path.c_str(), "wb"), std::fclose);
+							const auto &pixels = variant ? candidate_pixels[plane] : baseline_pixels[plane];
+							if (!file || std::fwrite(pixels.data(), 1, pixels.size(), file.get()) != pixels.size())
+								throw std::runtime_error("Failed to write mismatch diagnostic: " + path);
+						}
+				}
+				throw std::runtime_error("A/B decoded output differs: candidate is not bit-identical to baseline");
+			}
+			std::printf("A/B output: bit-identical on all three planes.\n");
+		}
+	}
+	if (options.render != "none")
+	{
+		std::vector<uint8_t> rgb(size_t(options.width) * options.height * 4), candidate(rgb.size());
+		[resources.render_output[0] getBytes:rgb.data() bytesPerRow:size_t(options.width) * 4
+		                        fromRegion:MTLRegionMake2D(0, 0, options.width, options.height) mipmapLevel:0];
+		if (variant_count == 2)
+		{
+			[resources.render_output[1] getBytes:candidate.data() bytesPerRow:size_t(options.width) * 4
+			                        fromRegion:MTLRegionMake2D(0, 0, options.width, options.height) mipmapLevel:0];
+			if (rgb != candidate)
+			{
+				size_t differing = 0; int maximum = 0;
+				for (size_t i = 0; i < rgb.size(); i++) { int d = std::abs(int(rgb[i]) - int(candidate[i])); differing += d != 0; maximum = std::max(maximum, d); }
+				throw std::runtime_error("A/B RGB output differs: " + std::to_string(differing) + " channels, max " + std::to_string(maximum) + " LSB");
+			}
+			std::printf("A/B offscreen RGB: bit-identical on all channels.\n");
+		}
+		std::printf("RGB output is offscreen; these timings exclude drawable acquisition and display presentation.\n");
 	}
 	write_samples(options.samples_path, records);
 	return EXIT_SUCCESS;

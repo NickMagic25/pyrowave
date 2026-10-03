@@ -11,6 +11,10 @@
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
 #include "experimental_dequant.msl.h"
 #include "experimental_idwt.msl.h"
+#include "experimental_native_dequant.msl.h"
+#include "experimental_native_idwt.msl.h"
+#include "experimental_fused_idwt.msl.h"
+#include "experimental_render.msl.h"
 #endif
 
 #include <memory>
@@ -119,6 +123,71 @@ id<MTLComputePipelineState> create_pipeline_bool_constant(pyrowave_device device
 }
 
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
+pyrowave_result ensure_native_dequant_pipelines(pyrowave_device device, bool hybrid)
+{
+	std::lock_guard<std::mutex> holder{device->bench_native_pipeline_lock};
+	if (device->bench_native_dequant_pipeline[hybrid] && device->bench_native_batched_dequant_pipeline[hybrid])
+		return device->bench_native_dequant_pipeline[hybrid].threadExecutionWidth == 32 &&
+		       device->bench_native_batched_dequant_pipeline[hybrid].threadExecutionWidth == 32 ?
+		       PYROWAVE_SUCCESS : PYROWAVE_ERROR_UNSUPPORTED_DEVICE;
+	const auto &source = hybrid ? hybrid_dequant_source() : native_dequant_source();
+	std::string batched;
+	if (source.empty() || !build_batched_dequant_msl(source.c_str(), batched))
+		return PYROWAVE_ERROR_SHADER_COMPILATION;
+	auto *library = compile_library(device, source.c_str(), "native packed dequant");
+	auto *batch_library = compile_library(device, batched.c_str(), "native packed batched dequant");
+	if (!library || !batch_library) return PYROWAVE_ERROR_SHADER_COMPILATION;
+	device->bench_native_dequant_pipeline[hybrid] = create_pipeline(device, library, "pyrowave_wavelet_dequant", DequantThreadgroupSize);
+	device->bench_native_batched_dequant_pipeline[hybrid] = create_pipeline(device, batch_library, "pyrowave_wavelet_dequant_batched", DequantThreadgroupSize);
+	return device->bench_native_dequant_pipeline[hybrid] && device->bench_native_batched_dequant_pipeline[hybrid] &&
+	       device->bench_native_dequant_pipeline[hybrid].threadExecutionWidth == 32 &&
+	       device->bench_native_batched_dequant_pipeline[hybrid].threadExecutionWidth == 32 ?
+	       PYROWAVE_SUCCESS : PYROWAVE_ERROR_SHADER_COMPILATION;
+}
+
+pyrowave_result ensure_native_idwt_pipelines(pyrowave_device device)
+{
+	static_assert(IdwtThreadgroupSize == 64, "Native iDWT load mapping requires 64 threads.");
+	std::lock_guard<std::mutex> holder{device->bench_native_pipeline_lock};
+	if (device->bench_native_idwt_pipeline[0] && device->bench_native_idwt_pipeline[1])
+		return PYROWAVE_SUCCESS;
+	const auto &source = native_idwt_source(device->precision);
+	if (source.empty()) return PYROWAVE_ERROR_SHADER_COMPILATION;
+	auto *library = compile_library(device, source.c_str(), "native tiled idwt");
+	if (!library) return PYROWAVE_ERROR_SHADER_COMPILATION;
+	for (int i = 0; i < 2; i++)
+		device->bench_native_idwt_pipeline[i] = create_pipeline_bool_constant(device, library, "pyrowave_idwt", IdwtThreadgroupSize, 0, i != 0);
+	return device->bench_native_idwt_pipeline[0] && device->bench_native_idwt_pipeline[1] ?
+	       PYROWAVE_SUCCESS : PYROWAVE_ERROR_SHADER_COMPILATION;
+}
+
+pyrowave_result ensure_fused_idwt_pipeline(pyrowave_device device, bool compact)
+{
+	static_assert(IdwtThreadgroupSize == 64, "Fused iDWT mapping requires 64 threads.");
+	std::lock_guard<std::mutex> holder{device->bench_native_pipeline_lock};
+	if (device->bench_fused_idwt_pipeline[compact]) return PYROWAVE_SUCCESS;
+	const auto &source = compact ? compact_fused_idwt_source(device->precision) : phase_aligned_fused_idwt_source(device->precision);
+	if (source.empty()) return PYROWAVE_ERROR_SHADER_COMPILATION;
+	auto *library = compile_library(device, source.c_str(), "fused two-level idwt");
+	if (!library) return PYROWAVE_ERROR_SHADER_COMPILATION;
+	device->bench_fused_idwt_pipeline[compact] = create_pipeline_bool_constant(device, library, "pyrowave_idwt_fused", IdwtThreadgroupSize, 0, true);
+	return device->bench_fused_idwt_pipeline[compact] ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_SHADER_COMPILATION;
+}
+
+pyrowave_result ensure_rgb_idwt_pipeline(pyrowave_device device, bool chroma_420)
+{
+	static_assert(IdwtThreadgroupSize == 64, "Fused RGB mapping requires 64 threads.");
+	std::lock_guard<std::mutex> holder{device->bench_native_pipeline_lock};
+	if (device->bench_rgb_idwt_pipeline[chroma_420]) return PYROWAVE_SUCCESS;
+	auto source = bench_fused_rgb_source(device->precision);
+	if (source.empty()) return PYROWAVE_ERROR_SHADER_COMPILATION;
+	auto *library = compile_library(device, source.c_str(), "fused idwt RGB");
+	if (!library) return PYROWAVE_ERROR_SHADER_COMPILATION;
+	device->bench_rgb_idwt_pipeline[chroma_420] = create_pipeline_bool_constant(device, library,
+		chroma_420 ? "pyrowave_idwt_rgb420" : "pyrowave_idwt_rgb", IdwtThreadgroupSize, 0, true);
+	return device->bench_rgb_idwt_pipeline[chroma_420] ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_SHADER_COMPILATION;
+}
+
 pyrowave_result ensure_batched_dequant_pipeline(pyrowave_device device)
 {
 	std::lock_guard<std::mutex> holder{device->bench_batched_dequant_lock};

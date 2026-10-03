@@ -77,6 +77,10 @@ id<MTLComputePipelineState> create_pipeline_bool_constant(pyrowave_device device
 // Lazily compiled only when the private benchmark explicitly opts into batching.
 pyrowave_result ensure_batched_dequant_pipeline(pyrowave_device device);
 pyrowave_result ensure_reduced_barrier_idwt_pipelines(pyrowave_device device);
+pyrowave_result ensure_native_dequant_pipelines(pyrowave_device device, bool hybrid = false);
+pyrowave_result ensure_native_idwt_pipelines(pyrowave_device device);
+pyrowave_result ensure_fused_idwt_pipeline(pyrowave_device device, bool compact = false);
+pyrowave_result ensure_rgb_idwt_pipeline(pyrowave_device device, bool chroma_420);
 #endif
 
 // The wavelet coefficient pyramid. The decoder fills it from the bitstream and
@@ -115,6 +119,12 @@ struct pyrowave_device_opaque
 	std::mutex bench_batched_dequant_lock;
 	id<MTLComputePipelineState> bench_reduced_barrier_idwt_pipeline[2];
 	std::mutex bench_reduced_barrier_idwt_lock;
+	id<MTLComputePipelineState> bench_native_dequant_pipeline[2];
+	id<MTLComputePipelineState> bench_native_batched_dequant_pipeline[2];
+	id<MTLComputePipelineState> bench_native_idwt_pipeline[2];
+	id<MTLComputePipelineState> bench_fused_idwt_pipeline[2];
+	id<MTLComputePipelineState> bench_rgb_idwt_pipeline[2];
+	std::mutex bench_native_pipeline_lock;
 #endif
 
 	// Encode. Compiled on demand by the first pyrowave_encoder_create(), so that

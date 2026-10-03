@@ -69,7 +69,9 @@ if (PYROWAVE_METAL_CLI)
 	# Keep private timing hooks out of the installed shared library/API. The CLI
 	# links its own static backend, so it can also run without a dylib search path.
 	add_library(pyrowave-metal-bench-backend STATIC ${PYROWAVE_METAL_SOURCES}
-		pyrowave_bench.h experimental_dequant.msl.h experimental_idwt.msl.h)
+		pyrowave_bench.h experimental_dequant.msl.h experimental_idwt.msl.h
+		experimental_native_dequant.msl.h experimental_native_idwt.msl.h
+		experimental_fused_idwt.msl.h experimental_render.msl.h)
 	target_compile_definitions(pyrowave-metal-bench-backend PRIVATE PYROWAVE_METAL_BENCH_HOOKS)
 	target_compile_options(pyrowave-metal-bench-backend PRIVATE ${PYROWAVE_CXX_FLAGS}
 		$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
